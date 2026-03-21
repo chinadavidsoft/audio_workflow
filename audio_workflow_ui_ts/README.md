@@ -3,7 +3,7 @@
 这是一个独立项目，用于在网页界面中配置并触发现有 Python 工作流：
 
 - 音频目录
-- `NOTION_PARENT_PAGE_ID`
+- `NOTION_DATABASE_ID`
 - `API_KEY`
 - `API_BASE_URL`（可选）
 - `NOTION_API_KEY`
@@ -16,7 +16,7 @@
 - 手动执行“一次处理”
 - 处理策略：
   - 扫描目录中的 `.mp3/.m4a`
-  - 若同目录已存在 `Transcript.md` 和 `Feedback.md`，则跳过
+  - 每次执行都会重新跑脚本，并以 upsert 方式覆盖 Notion 记录
   - 单个文件失败时只记录失败，不自动重试
 - 页面展示最近一次执行记录
 
@@ -39,4 +39,6 @@ npm run dev
 
 - 该 UI 不会改动现有 Python 模块代码，只是通过子进程调用：
   - `/Users/david/projects/custom-python-script/audio_transcript_review_to_notion/audio_transcript_review_to_notion.py`
+- 当前流程会把每个音频写入主库 `录音总表`，并自动维护 `转录 / ai语法点评 / ai重写` 这 3 个 relation。
+- `ai口语建议` 列不会被脚本触碰，适合手工填写。
 - API Key 会以明文保存在本地 `config.json`，请仅在可信环境使用。

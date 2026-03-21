@@ -6,7 +6,7 @@ import { URL } from "node:url";
 
 type AppConfig = {
   audioInboxDir: string;
-  notionParentPageId: string;
+  notionDatabaseId: string;
   apiKey: string;
   apiBaseUrl: string;
   notionApiKey: string;
@@ -17,6 +17,7 @@ type AppConfig = {
 
 type LegacyConfig = Partial<AppConfig> & {
   openaiApiKey?: string;
+  notionParentPageId?: string;
 };
 
 type FileRunResult = {
@@ -46,7 +47,7 @@ const REPORT_PATH = path.join(DATA_DIR, "last-run.json");
 
 const DEFAULT_CONFIG: AppConfig = {
   audioInboxDir: path.join(REPO_ROOT, "audio_inbox"),
-  notionParentPageId: "",
+  notionDatabaseId: "",
   apiKey: "",
   apiBaseUrl: "",
   notionApiKey: "",
@@ -99,6 +100,7 @@ async function loadConfig(): Promise<AppConfig> {
     return {
       ...DEFAULT_CONFIG,
       ...parsed,
+      notionDatabaseId: (parsed.notionDatabaseId ?? parsed.notionParentPageId ?? "").trim(),
       apiKey: (parsed.apiKey ?? parsed.openaiApiKey ?? "").trim(),
     };
   } catch {
@@ -259,8 +261,8 @@ async function runWorkflow(config: AppConfig): Promise<RunReport> {
   if (!config.audioInboxDir) {
     requiredProblems.push("音频目录未配置");
   }
-  if (!config.notionParentPageId) {
-    requiredProblems.push("NOTION_PARENT_PAGE_ID 未配置");
+  if (!config.notionDatabaseId) {
+    requiredProblems.push("NOTION_DATABASE_ID 未配置");
   }
   if (!config.apiKey) {
     requiredProblems.push("API_KEY 未配置");
@@ -305,29 +307,14 @@ async function runWorkflow(config: AppConfig): Promise<RunReport> {
   const files = await listAudioFiles(config.audioInboxDir, config.recursiveScan);
   const pythonExecutable = await resolvePythonExecutable();
   for (const audioFile of files) {
-    const parsed = path.parse(audioFile);
-    const transcriptPath = path.join(parsed.dir, `${parsed.name} - Transcript.md`);
-    const feedbackPath = path.join(parsed.dir, `${parsed.name} - Feedback.md`);
-
-    const transcriptExists = await pathExists(transcriptPath);
-    const feedbackExists = await pathExists(feedbackPath);
-    if (transcriptExists && feedbackExists) {
-      items.push({
-        filePath: audioFile,
-        status: "skipped",
-        detail: "已存在 Transcript 与 Feedback 文件",
-      });
-      continue;
-    }
-
     const result = await runCommand(
       pythonExecutable,
       [
         config.scriptPath,
         "--audio",
         audioFile,
-        "--parent-page-id",
-        config.notionParentPageId,
+        "--database-id",
+        config.notionDatabaseId,
         "--model",
         config.reviewModel || "gpt-5-mini",
       ],
@@ -445,8 +432,8 @@ function renderPage(config: AppConfig, report: RunReport | null, tip: string): s
         <label for="audioInboxDir">音频目录（audio inbox）</label>
         <input id="audioInboxDir" name="audioInboxDir" type="text" value="${escapeHtml(config.audioInboxDir)}" />
 
-        <label for="notionParentPageId">NOTION_PARENT_PAGE_ID</label>
-        <input id="notionParentPageId" name="notionParentPageId" type="text" value="${escapeHtml(config.notionParentPageId)}" />
+        <label for="notionDatabaseId">NOTION_DATABASE_ID</label>
+        <input id="notionDatabaseId" name="notionDatabaseId" type="text" value="${escapeHtml(config.notionDatabaseId)}" />
 
         <label for="apiKey">API_KEY</label>
         <input id="apiKey" name="apiKey" type="password" value="${escapeHtml(config.apiKey)}" />
@@ -511,7 +498,7 @@ async function handleSaveConfig(req: IncomingMessage, res: ServerResponse): Prom
   const next: AppConfig = {
     ...current,
     audioInboxDir: value(form, "audioInboxDir"),
-    notionParentPageId: value(form, "notionParentPageId"),
+    notionDatabaseId: value(form, "notionDatabaseId"),
     apiKey: value(form, "apiKey"),
     apiBaseUrl: value(form, "apiBaseUrl"),
     notionApiKey: value(form, "notionApiKey"),
