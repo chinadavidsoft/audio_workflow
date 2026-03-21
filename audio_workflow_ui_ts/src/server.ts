@@ -39,11 +39,29 @@ type RunReport = {
   items: FileRunResult[];
 };
 
+type JobStatus = "idle" | "running" | "completed" | "failed";
+
+type RunJobState = {
+  status: JobStatus;
+  startedAt: string | null;
+  endedAt: string | null;
+  currentFile: string | null;
+  logs: string[];
+  report: RunReport | null;
+  message: string;
+};
+
+type WorkflowHooks = {
+  onCurrentFile?: (filePath: string | null) => void;
+  onLog?: (line: string) => void;
+};
+
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const REPO_ROOT = path.resolve(PROJECT_ROOT, "..");
 const DATA_DIR = path.join(PROJECT_ROOT, "data");
 const CONFIG_PATH = path.join(DATA_DIR, "config.json");
 const REPORT_PATH = path.join(DATA_DIR, "last-run.json");
+const MAX_JOB_LOGS = 400;
 
 const DEFAULT_CONFIG: AppConfig = {
   audioInboxDir: path.join(REPO_ROOT, "audio_inbox"),
@@ -64,6 +82,16 @@ const PORT = Number(process.env.PORT ?? 4173);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const MODEL_OPTIONS = ["gpt-5-mini", "gpt-5", "deepseek-chat"];
 
+let currentJob: RunJobState = {
+  status: "idle",
+  startedAt: null,
+  endedAt: null,
+  currentFile: null,
+  logs: [],
+  report: null,
+  message: "空闲",
+};
+
 function escapeHtml(raw: string): string {
   return raw
     .replaceAll("&", "&amp;")
@@ -81,6 +109,12 @@ function sendHtml(res: ServerResponse, html: string): void {
   res.statusCode = 200;
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(ensureTrailingNewline(html));
+}
+
+function sendJson(res: ServerResponse, payload: unknown, statusCode = 200): void {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(payload));
 }
 
 function redirect(res: ServerResponse, location: string): void {
@@ -204,21 +238,68 @@ async function listAudioFiles(rootDir: string, recursive: boolean): Promise<stri
   return collected.map((item) => item.filePath);
 }
 
+function pushJobLog(line: string): void {
+  const trimmed = line.trimEnd();
+  if (!trimmed) {
+    return;
+  }
+  currentJob.logs.push(trimmed);
+  if (currentJob.logs.length > MAX_JOB_LOGS) {
+    currentJob.logs.splice(0, currentJob.logs.length - MAX_JOB_LOGS);
+  }
+}
+
+function setCurrentFile(filePath: string | null): void {
+  currentJob.currentFile = filePath;
+}
+
 async function runCommand(
   command: string,
   args: string[],
-  env: NodeJS.ProcessEnv
+  env: NodeJS.ProcessEnv,
+  onOutput?: (line: string) => void
 ): Promise<{ code: number; output: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { env });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
+    let stdoutBuffer = "";
+    let stderrBuffer = "";
+
+    const flushBuffer = (source: "stdout" | "stderr", isFinal: boolean): void => {
+      const buffered = source === "stdout" ? stdoutBuffer : stderrBuffer;
+      const segments = buffered.split(/\r?\n/);
+      const remainder = isFinal ? "" : segments.pop() ?? "";
+      const prefix = source === "stderr" ? "[stderr] " : "";
+      for (const segment of segments) {
+        if (segment.trim()) {
+          onOutput?.(`${prefix}${segment}`);
+        }
+      }
+      if (source === "stdout") {
+        stdoutBuffer = remainder;
+      } else {
+        stderrBuffer = remainder;
+      }
+      if (isFinal) {
+        const last = buffered.trim();
+        if (last && !buffered.includes("\n")) {
+          onOutput?.(`${prefix}${last}`);
+        }
+      }
+    };
 
     child.stdout.on("data", (chunk) => {
-      stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stdoutChunks.push(buffer);
+      stdoutBuffer += buffer.toString("utf-8");
+      flushBuffer("stdout", false);
     });
     child.stderr.on("data", (chunk) => {
-      stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stderrChunks.push(buffer);
+      stderrBuffer += buffer.toString("utf-8");
+      flushBuffer("stderr", false);
     });
     child.on("error", (error) => {
       resolve({
@@ -227,6 +308,8 @@ async function runCommand(
       });
     });
     child.on("close", (code) => {
+      flushBuffer("stdout", true);
+      flushBuffer("stderr", true);
       const output = `${Buffer.concat(stdoutChunks).toString("utf-8")}\n${Buffer.concat(
         stderrChunks
       ).toString("utf-8")}`.trim();
@@ -239,21 +322,10 @@ async function runCommand(
 }
 
 function buildChildEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-  ]) {
-    delete env[key];
-  }
-  return { ...env, ...overrides };
+  return { ...process.env, ...overrides };
 }
 
-async function runWorkflow(config: AppConfig): Promise<RunReport> {
+async function runWorkflow(config: AppConfig, hooks: WorkflowHooks = {}): Promise<RunReport> {
   const started = new Date();
   const items: FileRunResult[] = [];
 
@@ -306,7 +378,12 @@ async function runWorkflow(config: AppConfig): Promise<RunReport> {
 
   const files = await listAudioFiles(config.audioInboxDir, config.recursiveScan);
   const pythonExecutable = await resolvePythonExecutable();
-  for (const audioFile of files) {
+  hooks.onLog?.(`扫描完成，共发现 ${files.length} 个音频文件。`);
+
+  for (const [index, audioFile] of files.entries()) {
+    hooks.onCurrentFile?.(audioFile);
+    hooks.onLog?.(`开始处理 (${index + 1}/${files.length})：${audioFile}`);
+
     const result = await runCommand(
       pythonExecutable,
       [
@@ -322,7 +399,8 @@ async function runWorkflow(config: AppConfig): Promise<RunReport> {
         API_KEY: config.apiKey,
         API_BASE_URL: config.apiBaseUrl,
         NOTION_API_KEY: config.notionApiKey,
-      })
+      }),
+      hooks.onLog
     );
 
     items.push({
@@ -331,6 +409,8 @@ async function runWorkflow(config: AppConfig): Promise<RunReport> {
       detail: result.output,
     });
   }
+
+  hooks.onCurrentFile?.(null);
 
   const success = items.filter((item) => item.status === "success").length;
   const failed = items.filter((item) => item.status === "failed").length;
@@ -364,11 +444,7 @@ function renderReport(report: RunReport | null): string {
       : report.items
           .map(
             (item) =>
-              `<tr>
-  <td>${escapeHtml(item.filePath)}</td>
-  <td>${escapeHtml(item.status)}</td>
-  <td><pre>${escapeHtml(item.detail)}</pre></td>
-</tr>`
+              `<tr>\n  <td>${escapeHtml(item.filePath)}</td>\n  <td>${escapeHtml(item.status)}</td>\n  <td><pre>${escapeHtml(item.detail)}</pre></td>\n</tr>`
           )
           .join("\n");
 
@@ -392,14 +468,55 @@ function renderReport(report: RunReport | null): string {
 `;
 }
 
-function renderPage(config: AppConfig, report: RunReport | null, tip: string): string {
+function renderJobSummary(job: RunJobState): string {
+  return `
+<p><strong>状态：</strong> ${escapeHtml(job.status)}</p>
+<p><strong>说明：</strong> ${escapeHtml(job.message)}</p>
+<p><strong>开始：</strong> ${escapeHtml(job.startedAt ?? "-")}</p>
+<p><strong>结束：</strong> ${escapeHtml(job.endedAt ?? "-")}</p>
+<p><strong>当前文件：</strong> ${escapeHtml(job.currentFile ?? "-")}</p>
+`;
+}
+
+function serializeJob(job: RunJobState): RunJobState {
+  return {
+    status: job.status,
+    startedAt: job.startedAt,
+    endedAt: job.endedAt,
+    currentFile: job.currentFile,
+    logs: [...job.logs],
+    report: job.report,
+    message: job.message,
+  };
+}
+
+function reportIndicatesFailure(report: RunReport): boolean {
+  if (report.summary.failed > 0) {
+    return true;
+  }
+  if (report.message.startsWith("执行前校验失败")) {
+    return true;
+  }
+  if (report.message.startsWith("音频目录不存在")) {
+    return true;
+  }
+  if (report.message.startsWith("Python 脚本不存在")) {
+    return true;
+  }
+  return false;
+}
+
+function renderPage(config: AppConfig, job: RunJobState, report: RunReport | null, tip: string): string {
   const options = MODEL_OPTIONS.includes(config.reviewModel)
     ? MODEL_OPTIONS
     : [...MODEL_OPTIONS, config.reviewModel];
-  const modelOptionsHtml = options.map((item) => {
-    const selected = item === config.reviewModel ? "selected" : "";
-    return `<option value="${escapeHtml(item)}" ${selected}>${escapeHtml(item)}</option>`;
-  }).join("\n");
+  const modelOptionsHtml = options
+    .map((item) => {
+      const selected = item === config.reviewModel ? "selected" : "";
+      return `<option value="${escapeHtml(item)}" ${selected}>${escapeHtml(item)}</option>`;
+    })
+    .join("\n");
+  const initialReport = job.report ?? report;
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -408,16 +525,20 @@ function renderPage(config: AppConfig, report: RunReport | null, tip: string): s
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>音频工作流控制台</title>
     <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; line-height: 1.5; color: #111; }
-      .box { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; background: #fff; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; line-height: 1.5; color: #111; background: #f4f1ea; }
+      .box { border: 1px solid #d7d1c7; border-radius: 14px; padding: 16px; margin-bottom: 16px; background: #fffdf8; box-shadow: 0 8px 30px rgba(32, 24, 16, 0.06); }
       label { display: block; font-weight: 600; margin-top: 10px; }
-      input[type="text"], input[type="password"], select { width: 100%; padding: 8px; border: 1px solid #bbb; border-radius: 8px; }
-      .actions { margin-top: 14px; display: flex; gap: 8px; }
+      input[type="text"], input[type="password"], select { width: 100%; padding: 8px; border: 1px solid #bbb; border-radius: 8px; box-sizing: border-box; }
+      .actions { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
       button { border: 1px solid #333; background: #111; color: #fff; border-radius: 8px; padding: 8px 14px; cursor: pointer; }
       button.secondary { background: #fff; color: #111; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
       .tip { margin-bottom: 12px; color: #0b5; font-weight: 600; }
+      .error { color: #a02323; }
       pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
       table th { background: #f6f6f6; text-align: left; }
+      .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+      .muted { color: #666; }
     </style>
   </head>
   <body>
@@ -465,18 +586,161 @@ function renderPage(config: AppConfig, report: RunReport | null, tip: string): s
 
     <div class="box">
       <h2>执行</h2>
-      <form method="post" action="/run-once">
+      <p id="run-feedback" class="muted">点击后将在后台执行，页面不会阻塞。</p>
+      <form id="run-once-form" method="post" action="/run-once">
         <div class="actions">
-          <button type="submit">立即执行一次</button>
+          <button id="run-once-button" type="submit" ${job.status === "running" ? "disabled" : ""}>立即执行一次</button>
           <button class="secondary" type="button" onclick="location.reload()">刷新页面</button>
         </div>
       </form>
     </div>
 
+    <div class="status-grid">
+      <div class="box">
+        <h2>当前状态</h2>
+        <div id="job-summary">${renderJobSummary(job)}</div>
+      </div>
+      <div class="box">
+        <h2>运行日志</h2>
+        <pre id="job-logs">${escapeHtml(job.logs.join("\n") || "暂无日志。")}</pre>
+      </div>
+    </div>
+
     <div class="box">
       <h2>最近一次执行记录</h2>
-      ${renderReport(report)}
+      <div id="report-container">${renderReport(initialReport)}</div>
     </div>
+
+    <script>
+      const runForm = document.getElementById("run-once-form");
+      const runButton = document.getElementById("run-once-button");
+      const feedbackEl = document.getElementById("run-feedback");
+      const summaryEl = document.getElementById("job-summary");
+      const logsEl = document.getElementById("job-logs");
+      const reportEl = document.getElementById("report-container");
+      let pollTimer = null;
+
+      function escapeHtmlClient(raw) {
+        return String(raw)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function renderJobSummaryClient(job) {
+        return [
+          "<p><strong>状态：</strong> " + escapeHtmlClient(job.status) + "</p>",
+          "<p><strong>说明：</strong> " + escapeHtmlClient(job.message || "-") + "</p>",
+          "<p><strong>开始：</strong> " + escapeHtmlClient(job.startedAt || "-") + "</p>",
+          "<p><strong>结束：</strong> " + escapeHtmlClient(job.endedAt || "-") + "</p>",
+          "<p><strong>当前文件：</strong> " + escapeHtmlClient(job.currentFile || "-") + "</p>"
+        ].join("\n");
+      }
+
+      function renderReportClient(report) {
+        if (!report) {
+          return "<p>暂无执行记录。</p>";
+        }
+        const rows = (report.items || []).length === 0
+          ? "<tr><td colspan='3'>无</td></tr>"
+          : report.items.map((item) =>
+              "\n<tr>\n  <td>" + escapeHtmlClient(item.filePath) + "</td>\n  <td>" +
+              escapeHtmlClient(item.status) + "</td>\n  <td><pre>" +
+              escapeHtmlClient(item.detail) + "</pre></td>\n</tr>"
+            ).join("");
+        return "\n<p><strong>开始：</strong> " + escapeHtmlClient(report.startedAt) +
+          "</p>\n<p><strong>结束：</strong> " + escapeHtmlClient(report.endedAt) +
+          "</p>\n<p><strong>结果：</strong> " + escapeHtmlClient(report.message) +
+          "</p>\n<p><strong>统计：</strong> total=" + report.summary.total +
+          ", success=" + report.summary.success +
+          ", failed=" + report.summary.failed +
+          ", skipped=" + report.summary.skipped +
+          "</p>\n<table border=\"1\" cellspacing=\"0\" cellpadding=\"8\" style=\"width:100%;border-collapse:collapse\">\n  <thead>\n    <tr>\n      <th>文件</th>\n      <th>状态</th>\n      <th>详情</th>\n    </tr>\n  </thead>\n  <tbody>" + rows + "\n  </tbody>\n</table>";
+      }
+
+      function updateUi(job) {
+        summaryEl.innerHTML = renderJobSummaryClient(job);
+        logsEl.textContent = (job.logs && job.logs.length > 0) ? job.logs.join("\n") : "暂无日志。";
+        reportEl.innerHTML = renderReportClient(job.report);
+        runButton.disabled = job.status === "running";
+        if (job.status === "running") {
+          feedbackEl.textContent = "后台处理中，状态和日志会自动刷新。";
+          startPolling();
+          return;
+        }
+        if (job.status === "completed") {
+          feedbackEl.textContent = "后台任务已完成。";
+        } else if (job.status === "failed") {
+          feedbackEl.textContent = "后台任务失败，请查看日志和执行记录。";
+          feedbackEl.classList.add("error");
+        } else {
+          feedbackEl.textContent = "点击后将在后台执行，页面不会阻塞。";
+        }
+        if (job.status !== "failed") {
+          feedbackEl.classList.remove("error");
+        }
+        stopPolling();
+      }
+
+      async function fetchStatus() {
+        const response = await fetch("/run-status", { headers: { "Accept": "application/json" } });
+        if (!response.ok) {
+          throw new Error("状态请求失败: " + response.status);
+        }
+        const payload = await response.json();
+        updateUi(payload.job);
+      }
+
+      function startPolling() {
+        if (pollTimer) {
+          return;
+        }
+        pollTimer = window.setInterval(() => {
+          fetchStatus().catch((error) => {
+            feedbackEl.textContent = error.message;
+            feedbackEl.classList.add("error");
+          });
+        }, 2500);
+      }
+
+      function stopPolling() {
+        if (!pollTimer) {
+          return;
+        }
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+
+      runForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        runButton.disabled = true;
+        feedbackEl.textContent = "已提交后台任务，正在启动...";
+        feedbackEl.classList.remove("error");
+        try {
+          const response = await fetch("/run-once", {
+            method: "POST",
+            headers: { "Accept": "application/json" },
+          });
+          const payload = await response.json();
+          feedbackEl.textContent = payload.message || "后台任务已启动。";
+          if (!response.ok) {
+            feedbackEl.classList.add("error");
+          }
+          await fetchStatus();
+        } catch (error) {
+          feedbackEl.textContent = error instanceof Error ? error.message : String(error);
+          feedbackEl.classList.add("error");
+          runButton.disabled = false;
+        }
+      });
+
+      fetchStatus().catch((error) => {
+        feedbackEl.textContent = error instanceof Error ? error.message : String(error);
+        feedbackEl.classList.add("error");
+      });
+    </script>
   </body>
 </html>`;
 }
@@ -485,8 +749,8 @@ function tipFromQuery(url: URL): string {
   if (url.searchParams.get("saved") === "1") {
     return "配置已保存";
   }
-  if (url.searchParams.get("ran") === "1") {
-    return "工作流已执行一次";
+  if (url.searchParams.get("started") === "1") {
+    return "后台任务已启动";
   }
   return "";
 }
@@ -510,11 +774,83 @@ async function handleSaveConfig(req: IncomingMessage, res: ServerResponse): Prom
   redirect(res, "/?saved=1");
 }
 
+async function startWorkflowJob(config: AppConfig): Promise<void> {
+  currentJob = {
+    status: "running",
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+    currentFile: null,
+    logs: [],
+    report: currentJob.report,
+    message: "后台任务执行中",
+  };
+  pushJobLog("任务已启动。");
+
+  try {
+    const report = await runWorkflow(config, {
+      onCurrentFile: setCurrentFile,
+      onLog: pushJobLog,
+    });
+    await saveLastRunReport(report);
+    currentJob = {
+      ...currentJob,
+      status: reportIndicatesFailure(report) ? "failed" : "completed",
+      endedAt: report.endedAt,
+      currentFile: null,
+      report,
+      message: report.message,
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushJobLog(`后台任务异常：${detail}`);
+    currentJob = {
+      ...currentJob,
+      status: "failed",
+      endedAt: new Date().toISOString(),
+      currentFile: null,
+      message: `后台任务异常：${detail}`,
+    };
+  }
+}
+
 async function handleRunOnce(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const accepts = _req.headers.accept ?? "";
+  const wantsJson = accepts.includes("application/json");
+
+  if (currentJob.status === "running") {
+    if (wantsJson) {
+      sendJson(
+        res,
+        {
+          started: false,
+          status: currentJob.status,
+          message: "已有后台任务在执行，请等待当前任务完成。",
+        },
+        409
+      );
+    } else {
+      redirect(res, "/");
+    }
+    return;
+  }
+
   const config = await loadConfig();
-  const report = await runWorkflow(config);
-  await saveLastRunReport(report);
-  redirect(res, "/?ran=1");
+  void startWorkflowJob(config);
+  if (wantsJson) {
+    sendJson(res, {
+      started: true,
+      status: "running",
+      message: "后台任务已启动。",
+    });
+    return;
+  }
+  redirect(res, "/?started=1");
+}
+
+function handleRunStatus(res: ServerResponse): void {
+  sendJson(res, {
+    job: serializeJob(currentJob),
+  });
 }
 
 const server = createServer(async (req, res) => {
@@ -531,7 +867,15 @@ const server = createServer(async (req, res) => {
 
     if (method === "GET" && pathname === "/") {
       const [config, report] = await Promise.all([loadConfig(), loadLastRunReport()]);
-      sendHtml(res, renderPage(config, report, tipFromQuery(parsedUrl)));
+      if (!currentJob.report) {
+        currentJob = { ...currentJob, report };
+      }
+      sendHtml(res, renderPage(config, currentJob, report, tipFromQuery(parsedUrl)));
+      return;
+    }
+
+    if (method === "GET" && pathname === "/run-status") {
+      handleRunStatus(res);
       return;
     }
 

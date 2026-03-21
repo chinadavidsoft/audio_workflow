@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+
+import httpx
 
 try:
     from openai import OpenAI
@@ -28,12 +30,12 @@ DEFAULT_REVIEW_MODEL = "gpt-5-mini"
 NOTION_VERSION = "2022-06-28"
 NOTION_BASE_URL = "https://api.notion.com/v1"
 NOTION_RICH_TEXT_LIMIT = 1800
+NOTION_BLOCKS_PER_REQUEST = 100
 
 MAIN_TRANSCRIPT_PROPERTY = "转录"
 MAIN_GRAMMAR_RELATION_PROPERTY = "ai语法点评"
 MAIN_REWRITE_RELATION_PROPERTY = "ai重写"
 MAIN_SPEAKING_RELATION_PROPERTY = "ai口语建议"
-DETAIL_CONTENT_PROPERTY = "内容"
 UPDATED_AT_PROPERTY = "更新时间"
 
 GRAMMAR_TITLE = "AI语法点评"
@@ -92,6 +94,7 @@ def validate_audio_path(audio_path: Path) -> Path:
 def build_openai_client(api_key: str, base_url: str | None = None) -> OpenAI:
     if OpenAI is None:
         fail("Python package 'openai' is not installed. Install with: pip install openai")
+    ensure_socks_proxy_support()
     if base_url:
         return OpenAI(api_key=api_key, base_url=base_url)
     return OpenAI(api_key=api_key)
@@ -198,7 +201,7 @@ def request_grammar_review(client: OpenAI, model: str, transcript_markdown: str)
     system_prompt = "You are an English speaking coach. Be candid, direct, and useful."
     user_prompt = (
         "Review the learner's spoken English transcript.\n"
-        "Output Markdown only.\n"
+        "Output Markdown only. Do not use code fences. Do not wrap the answer in ```markdown.\n"
         "Cover grammar, word choice, naturalness, and clarity.\n"
         "Quote concrete examples from the transcript.\n"
         "Each key point must be English first, then Chinese.\n\n"
@@ -212,7 +215,7 @@ def request_rewrite(client: OpenAI, model: str, transcript_markdown: str) -> str
     system_prompt = "You are an English speaking coach. Write concise, natural spoken English."
     user_prompt = (
         "Rewrite the learner's spoken English transcript.\n"
-        "Output Markdown only.\n"
+        "Output Markdown only. Do not use code fences. Do not wrap the answer in ```markdown.\n"
         "Provide one full improved rewrite in natural spoken English.\n"
         "After the rewrite, add a concise Chinese explanation of the main improvements.\n\n"
         "Transcript:\n"
@@ -252,24 +255,51 @@ def write_markdown(path: Path, content: str) -> None:
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
 
 
+def build_text_block(block_type: str, text: str) -> dict:
+    return {
+        "object": "block",
+        "type": block_type,
+        block_type: {"rich_text": rich_text_chunks(text)},
+    }
+
+
+def detect_socks_proxy() -> tuple[str, str] | None:
+    for key in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "all_proxy", "https_proxy", "http_proxy"):
+        value = os.environ.get(key, "").strip()
+        if value.lower().startswith("socks"):
+            return key, value
+    return None
+
+
+def ensure_socks_proxy_support() -> None:
+    detected = detect_socks_proxy()
+    if detected is None:
+        return
+    if importlib.util.find_spec("socksio") is not None:
+        return
+    proxy_key, proxy_value = detected
+    fail(
+        "Detected SOCKS proxy in environment but missing dependency 'socksio'. "
+        f"{proxy_key}={proxy_value}. Install with: ./.venv/bin/pip install socksio"
+    )
+
+
 def notion_request(method: str, endpoint: str, token: str, payload: dict | None = None) -> dict:
+    ensure_socks_proxy_support()
     url = f"{NOTION_BASE_URL}{endpoint}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = Request(url=url, method=method, headers=headers, data=data)
-
     try:
-        with urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise NotionAPIError(f"HTTP {exc.code} on {endpoint}: {body}") from exc
-    except URLError as exc:
+        response = httpx.request(method, url, headers=headers, json=payload, timeout=30.0)
+        response.raise_for_status()
+        return response.json() if response.content else {}
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text
+        raise NotionAPIError(f"HTTP {exc.response.status_code} on {endpoint}: {body}") from exc
+    except httpx.HTTPError as exc:
         raise NotionAPIError(f"Network error on {endpoint}: {exc}") from exc
 
 
@@ -315,7 +345,6 @@ def get_relation_database_id(database_properties: dict[str, dict], property_name
 
 def validate_detail_database_schema(database_properties: dict[str, dict], label: str) -> None:
     get_title_property_name(database_properties)
-    require_property(database_properties, DETAIL_CONTENT_PROPERTY, {"rich_text"})
     updated_at_meta = database_properties.get(UPDATED_AT_PROPERTY)
     if updated_at_meta is not None and str(updated_at_meta.get("type", "")).strip() != "date":
         fail(f"{label} database property {UPDATED_AT_PROPERTY} must be a date if present")
@@ -329,6 +358,93 @@ def rich_text_chunks(text: str) -> list[dict]:
         segment = text[start : start + NOTION_RICH_TEXT_LIMIT]
         chunks.append({"type": "text", "text": {"content": segment}})
     return chunks
+
+
+def strip_markdown_fence(markdown: str) -> str:
+    cleaned = markdown.strip()
+    fence_pattern = re.compile(r"^```(?:[A-Za-z0-9_-]+)?\s*\n(?P<body>.*)\n```$", re.DOTALL)
+    while True:
+        match = fence_pattern.match(cleaned)
+        if not match:
+            break
+        cleaned = match.group("body").strip()
+    return cleaned
+
+
+def markdown_to_notion_blocks(markdown: str) -> list[dict]:
+    cleaned = strip_markdown_fence(markdown)
+    blocks: list[dict] = []
+    paragraph_lines: list[str] = []
+
+    def flush_paragraph() -> None:
+        if not paragraph_lines:
+            return
+        text = " ".join(line.strip() for line in paragraph_lines if line.strip()).strip()
+        paragraph_lines.clear()
+        if text:
+            blocks.append(build_text_block("paragraph", text))
+
+    for raw_line in cleaned.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            flush_paragraph()
+            continue
+        if stripped.startswith("### "):
+            flush_paragraph()
+            blocks.append(build_text_block("heading_3", stripped[4:].strip()))
+            continue
+        if stripped.startswith("## "):
+            flush_paragraph()
+            blocks.append(build_text_block("heading_2", stripped[3:].strip()))
+            continue
+        if stripped.startswith("# "):
+            flush_paragraph()
+            blocks.append(build_text_block("heading_1", stripped[2:].strip()))
+            continue
+        if stripped.startswith("- "):
+            flush_paragraph()
+            blocks.append(build_text_block("bulleted_list_item", stripped[2:].strip()))
+            continue
+        paragraph_lines.append(line)
+
+    flush_paragraph()
+    if not blocks:
+        blocks.append(build_text_block("paragraph", "(empty)"))
+    return blocks
+
+
+def append_blocks(page_id: str, blocks: list[dict], notion_token: str) -> None:
+    for index in range(0, len(blocks), NOTION_BLOCKS_PER_REQUEST):
+        batch = blocks[index : index + NOTION_BLOCKS_PER_REQUEST]
+        notion_request("PATCH", f"/blocks/{quote(page_id)}/children", notion_token, payload={"children": batch})
+
+
+def iter_block_children(parent_id: str, notion_token: str) -> Iterable[dict]:
+    start_cursor: str | None = None
+    while True:
+        endpoint = f"/blocks/{quote(parent_id)}/children?page_size=100"
+        if start_cursor:
+            endpoint += f"&start_cursor={quote(start_cursor)}"
+        data = notion_request("GET", endpoint, notion_token)
+        for item in data.get("results", []):
+            yield item
+        if not data.get("has_more"):
+            break
+        start_cursor = data.get("next_cursor")
+        if not start_cursor:
+            break
+
+
+def clear_page_content(page_id: str, notion_token: str) -> int:
+    archived_count = 0
+    for block in iter_block_children(page_id, notion_token):
+        block_id = str(block.get("id", "")).strip()
+        if not block_id:
+            continue
+        notion_request("PATCH", f"/blocks/{quote(block_id)}", notion_token, payload={"archived": True})
+        archived_count += 1
+    return archived_count
 
 
 def query_existing_pages(
@@ -380,7 +496,6 @@ def update_database_page(page_id: str, properties: dict, notion_token: str) -> d
 def make_detail_database_properties(
     database_properties: dict[str, dict],
     audio_path: Path,
-    content_markdown: str,
     processed_at_iso: str,
 ) -> dict:
     title_property = get_title_property_name(database_properties)
@@ -388,7 +503,6 @@ def make_detail_database_properties(
         title_property: {
             "title": [{"type": "text", "text": {"content": audio_path.name}}],
         },
-        DETAIL_CONTENT_PROPERTY: {"rich_text": rich_text_chunks(content_markdown)},
     }
     updated_at_meta = database_properties.get(UPDATED_AT_PROPERTY)
     if isinstance(updated_at_meta, dict) and str(updated_at_meta.get("type", "")).strip() == "date":
@@ -452,6 +566,28 @@ def upsert_database_page(
     return page_id, mode, len(existing_pages)
 
 
+def rewrite_page_body(page_id: str, markdown: str, notion_token: str) -> int:
+    blocks = markdown_to_notion_blocks(markdown)
+    removed_blocks = clear_page_content(page_id, notion_token)
+    append_blocks(page_id, blocks, notion_token)
+    return removed_blocks
+
+
+def generate_feedback_pair(client: OpenAI, model: str, transcript_markdown: str) -> tuple[str, str]:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        grammar_future = executor.submit(request_grammar_review, client, model, transcript_markdown)
+        rewrite_future = executor.submit(request_rewrite, client, model, transcript_markdown)
+        try:
+            grammar_review = grammar_future.result()
+        except BaseException as exc:
+            fail(f"Grammar review generation failed: {exc}")
+        try:
+            rewrite = rewrite_future.result()
+        except BaseException as exc:
+            fail(f"Rewrite generation failed: {exc}")
+        return grammar_review, rewrite
+
+
 def main() -> None:
     args = parse_args()
     audio_path = validate_audio_path(args.audio)
@@ -475,9 +611,8 @@ def main() -> None:
     write_markdown(transcript_path, transcript_markdown)
     print(f"[3/6] Saved transcript Markdown: {transcript_path}")
 
-    print(f"[4/6] Generating grammar feedback and rewrite with model: {args.model}")
-    grammar_review = request_grammar_review(client, args.model, transcript_markdown)
-    rewrite = request_rewrite(client, args.model, transcript_markdown)
+    print(f"[4/6] Generating grammar feedback and rewrite concurrently with model: {args.model}")
+    grammar_review, rewrite = generate_feedback_pair(client, args.model, transcript_markdown)
     feedback_markdown = build_feedback_markdown(grammar_review, rewrite)
     feedback_path = audio_path.with_name(f"{audio_path.stem} - Feedback.md")
     write_markdown(feedback_path, feedback_markdown)
@@ -507,7 +642,6 @@ def main() -> None:
         transcript_properties = make_detail_database_properties(
             transcript_database_properties,
             audio_path,
-            transcript_markdown,
             processed_at_iso,
         )
         transcript_page_id, transcript_mode, transcript_duplicates = upsert_database_page(
@@ -521,7 +655,6 @@ def main() -> None:
         grammar_properties = make_detail_database_properties(
             grammar_database_properties,
             audio_path,
-            grammar_review,
             processed_at_iso,
         )
         grammar_page_id, grammar_mode, grammar_duplicates = upsert_database_page(
@@ -535,7 +668,6 @@ def main() -> None:
         rewrite_properties = make_detail_database_properties(
             rewrite_database_properties,
             audio_path,
-            rewrite,
             processed_at_iso,
         )
         rewrite_page_id, rewrite_mode, rewrite_duplicates = upsert_database_page(
@@ -545,6 +677,10 @@ def main() -> None:
             notion_api_key,
             rewrite_database_properties,
         )
+
+        transcript_archived = rewrite_page_body(transcript_page_id, transcript_markdown, notion_api_key)
+        grammar_archived = rewrite_page_body(grammar_page_id, grammar_review, notion_api_key)
+        rewrite_archived = rewrite_page_body(rewrite_page_id, rewrite, notion_api_key)
 
         main_properties = make_main_database_properties(
             main_database_properties,
@@ -575,6 +711,12 @@ def main() -> None:
         print(f"[WARN] Grammar detail matched {grammar_duplicates} duplicate records.")
     if rewrite_duplicates > 1:
         print(f"[WARN] Rewrite detail matched {rewrite_duplicates} duplicate records.")
+    if transcript_archived > 0:
+        print(f"[INFO] Transcript detail archived {transcript_archived} old body blocks.")
+    if grammar_archived > 0:
+        print(f"[INFO] Grammar detail archived {grammar_archived} old body blocks.")
+    if rewrite_archived > 0:
+        print(f"[INFO] Rewrite detail archived {rewrite_archived} old body blocks.")
 
     print("[6/6] Notion relation upsert completed")
     print(f"  Main record: {main_mode} {main_page_id}")

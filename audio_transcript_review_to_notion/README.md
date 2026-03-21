@@ -38,6 +38,12 @@
 pip install openai
 ```
 
+如果当前网络环境依赖 SOCKS 代理，还需要：
+
+```bash
+pip install socksio
+```
+
 必须安装本地转写依赖：
 
 ```bash
