@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Transcribe an MP3/M4A file with local Whisper, generate AI grammar feedback "
-            "and rewrite, save local Markdown files, and upsert Notion relations."
+            "and rewrite, then upsert Notion relations."
         )
     )
     parser.add_argument("--audio", required=True, type=Path, help="Path to input audio file")
@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=DEFAULT_REVIEW_MODEL,
         help=f"Model used for feedback generation (default: {DEFAULT_REVIEW_MODEL})",
+    )
+    parser.add_argument(
+        "--write-local-md",
+        action="store_true",
+        help="Write transcript/feedback Markdown files next to the audio file",
     )
     return parser.parse_args()
 
@@ -495,19 +500,23 @@ def update_database_page(page_id: str, properties: dict, notion_token: str) -> d
 
 def make_detail_database_properties(
     database_properties: dict[str, dict],
-    audio_path: Path,
+    detail_title: str,
     processed_at_iso: str,
 ) -> dict:
     title_property = get_title_property_name(database_properties)
     properties: dict[str, dict] = {
         title_property: {
-            "title": [{"type": "text", "text": {"content": audio_path.name}}],
+            "title": [{"type": "text", "text": {"content": detail_title}}],
         },
     }
     updated_at_meta = database_properties.get(UPDATED_AT_PROPERTY)
     if isinstance(updated_at_meta, dict) and str(updated_at_meta.get("type", "")).strip() == "date":
         properties[UPDATED_AT_PROPERTY] = {"date": {"start": processed_at_iso}}
     return properties
+
+
+def make_ai_detail_title(audio_path: Path, suffix: str) -> str:
+    return f"{audio_path.stem}-{suffix}"
 
 
 def make_main_database_properties(
@@ -607,16 +616,22 @@ def main() -> None:
     transcript_markdown = format_transcript_markdown(transcript_raw)
     assert_transcript_fidelity(transcript_raw, transcript_markdown)
 
-    transcript_path = audio_path.with_name(f"{audio_path.stem} - Transcript.md")
-    write_markdown(transcript_path, transcript_markdown)
-    print(f"[3/6] Saved transcript Markdown: {transcript_path}")
+    if args.write_local_md:
+        transcript_path = audio_path.with_name(f"{audio_path.stem} - Transcript.md")
+        write_markdown(transcript_path, transcript_markdown)
+        print(f"[3/6] Saved transcript Markdown: {transcript_path}")
+    else:
+        print("[3/6] Skipped local transcript Markdown (disabled by default)")
 
     print(f"[4/6] Generating grammar feedback and rewrite concurrently with model: {args.model}")
     grammar_review, rewrite = generate_feedback_pair(client, args.model, transcript_markdown)
     feedback_markdown = build_feedback_markdown(grammar_review, rewrite)
-    feedback_path = audio_path.with_name(f"{audio_path.stem} - Feedback.md")
-    write_markdown(feedback_path, feedback_markdown)
-    print(f"[5/6] Saved feedback Markdown: {feedback_path}")
+    if args.write_local_md:
+        feedback_path = audio_path.with_name(f"{audio_path.stem} - Feedback.md")
+        write_markdown(feedback_path, feedback_markdown)
+        print(f"[5/6] Saved feedback Markdown: {feedback_path}")
+    else:
+        print("[5/6] Skipped local feedback Markdown (disabled by default)")
 
     processed_at_iso = (
         datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -641,12 +656,12 @@ def main() -> None:
 
         transcript_properties = make_detail_database_properties(
             transcript_database_properties,
-            audio_path,
+            make_ai_detail_title(audio_path, "转录"),
             processed_at_iso,
         )
         transcript_page_id, transcript_mode, transcript_duplicates = upsert_database_page(
             transcript_database_id,
-            audio_path.name,
+            make_ai_detail_title(audio_path, "转录"),
             transcript_properties,
             notion_api_key,
             transcript_database_properties,
@@ -654,12 +669,12 @@ def main() -> None:
 
         grammar_properties = make_detail_database_properties(
             grammar_database_properties,
-            audio_path,
+            make_ai_detail_title(audio_path, "点评"),
             processed_at_iso,
         )
         grammar_page_id, grammar_mode, grammar_duplicates = upsert_database_page(
             grammar_database_id,
-            audio_path.name,
+            make_ai_detail_title(audio_path, "点评"),
             grammar_properties,
             notion_api_key,
             grammar_database_properties,
@@ -667,12 +682,12 @@ def main() -> None:
 
         rewrite_properties = make_detail_database_properties(
             rewrite_database_properties,
-            audio_path,
+            make_ai_detail_title(audio_path, "重写"),
             processed_at_iso,
         )
         rewrite_page_id, rewrite_mode, rewrite_duplicates = upsert_database_page(
             rewrite_database_id,
-            audio_path.name,
+            make_ai_detail_title(audio_path, "重写"),
             rewrite_properties,
             notion_api_key,
             rewrite_database_properties,
@@ -698,10 +713,12 @@ def main() -> None:
             main_database_properties,
         )
     except NotionAPIError as exc:
-        fail(
-            "Notion database upsert failed after local Markdown files were saved. "
-            f"Retry upload later. Details: {exc}"
-        )
+        if args.write_local_md:
+            fail(
+                "Notion database upsert failed after local Markdown files were saved. "
+                f"Retry upload later. Details: {exc}"
+            )
+        fail(f"Notion database upsert failed. Details: {exc}")
 
     if main_duplicates > 1:
         print(f"[WARN] Main record matched {main_duplicates} duplicate records.")

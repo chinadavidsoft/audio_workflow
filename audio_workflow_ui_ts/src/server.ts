@@ -26,6 +26,23 @@ type FileRunResult = {
   detail: string;
 };
 
+type AudioFileEntry = {
+  filePath: string;
+  mtimeMs: number;
+  size: number;
+  signature: string;
+};
+
+type ProcessedRecord = {
+  signature: string;
+  processedAt: string;
+};
+
+type ProcessedFilesState = {
+  version: 1;
+  files: Record<string, ProcessedRecord>;
+};
+
 type RunReport = {
   startedAt: string;
   endedAt: string;
@@ -61,6 +78,7 @@ const REPO_ROOT = path.resolve(PROJECT_ROOT, "..");
 const DATA_DIR = path.join(PROJECT_ROOT, "data");
 const CONFIG_PATH = path.join(DATA_DIR, "config.json");
 const REPORT_PATH = path.join(DATA_DIR, "last-run.json");
+const PROCESSED_FILES_PATH = path.join(DATA_DIR, "processed-files.json");
 const MAX_JOB_LOGS = 400;
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -161,6 +179,32 @@ async function saveLastRunReport(report: RunReport): Promise<void> {
   await fs.writeFile(REPORT_PATH, JSON.stringify(report, null, 2), "utf-8");
 }
 
+function fileSignature(size: number, mtimeMs: number): string {
+  return `${size}:${Math.round(mtimeMs)}`;
+}
+
+function defaultProcessedState(): ProcessedFilesState {
+  return { version: 1, files: {} };
+}
+
+async function loadProcessedState(): Promise<ProcessedFilesState> {
+  try {
+    const raw = await fs.readFile(PROCESSED_FILES_PATH, "utf-8");
+    const parsed = JSON.parse(raw) as Partial<ProcessedFilesState>;
+    if (parsed.version === 1 && parsed.files && typeof parsed.files === "object") {
+      return { version: 1, files: parsed.files };
+    }
+    return defaultProcessedState();
+  } catch {
+    return defaultProcessedState();
+  }
+}
+
+async function saveProcessedState(state: ProcessedFilesState): Promise<void> {
+  await ensureDataDir();
+  await fs.writeFile(PROCESSED_FILES_PATH, JSON.stringify(state, null, 2), "utf-8");
+}
+
 async function readBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -199,8 +243,8 @@ function isAudioFile(filePath: string): boolean {
   return ext === ".mp3" || ext === ".m4a";
 }
 
-async function listAudioFiles(rootDir: string, recursive: boolean): Promise<string[]> {
-  const collected: Array<{ filePath: string; mtimeMs: number }> = [];
+async function listAudioFiles(rootDir: string, recursive: boolean): Promise<AudioFileEntry[]> {
+  const collected: AudioFileEntry[] = [];
   const queue = [rootDir];
 
   while (queue.length > 0) {
@@ -230,12 +274,17 @@ async function listAudioFiles(rootDir: string, recursive: boolean): Promise<stri
       }
 
       const stat = await fs.stat(fullPath);
-      collected.push({ filePath: fullPath, mtimeMs: stat.mtimeMs });
+      collected.push({
+        filePath: fullPath,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        signature: fileSignature(stat.size, stat.mtimeMs),
+      });
     }
   }
 
   collected.sort((a, b) => a.mtimeMs - b.mtimeMs);
-  return collected.map((item) => item.filePath);
+  return collected;
 }
 
 function pushJobLog(line: string): void {
@@ -377,10 +426,24 @@ async function runWorkflow(config: AppConfig, hooks: WorkflowHooks = {}): Promis
   }
 
   const files = await listAudioFiles(config.audioInboxDir, config.recursiveScan);
+  const processedState = await loadProcessedState();
+  let processedStateChanged = false;
   const pythonExecutable = await resolvePythonExecutable();
   hooks.onLog?.(`扫描完成，共发现 ${files.length} 个音频文件。`);
 
-  for (const [index, audioFile] of files.entries()) {
+  for (const [index, file] of files.entries()) {
+    const audioFile = file.filePath;
+    const prior = processedState.files[audioFile];
+    if (prior && prior.signature === file.signature) {
+      items.push({
+        filePath: audioFile,
+        status: "skipped",
+        detail: "已成功处理且文件未变化，自动跳过。",
+      });
+      hooks.onLog?.(`跳过 (${index + 1}/${files.length})：${audioFile}`);
+      continue;
+    }
+
     hooks.onCurrentFile?.(audioFile);
     hooks.onLog?.(`开始处理 (${index + 1}/${files.length})：${audioFile}`);
 
@@ -408,6 +471,18 @@ async function runWorkflow(config: AppConfig, hooks: WorkflowHooks = {}): Promis
       status: result.code === 0 ? "success" : "failed",
       detail: result.output,
     });
+
+    if (result.code === 0) {
+      processedState.files[audioFile] = {
+        signature: file.signature,
+        processedAt: new Date().toISOString(),
+      };
+      processedStateChanged = true;
+    }
+  }
+
+  if (processedStateChanged) {
+    await saveProcessedState(processedState);
   }
 
   hooks.onCurrentFile?.(null);
@@ -428,7 +503,11 @@ async function runWorkflow(config: AppConfig, hooks: WorkflowHooks = {}): Promis
     message:
       items.length === 0
         ? "目录中没有可处理的 mp3/m4a 文件"
-        : "执行完成（失败项已保留，需人工重跑）",
+        : failed > 0
+        ? "执行完成（失败项已保留，需人工重跑）"
+        : skipped > 0
+        ? "执行完成（已自动跳过未变化且已处理的文件）"
+        : "执行完成",
     items,
   };
 }

@@ -16,7 +16,8 @@
 - 手动执行“一次处理”
 - 处理策略：
   - 扫描目录中的 `.mp3/.m4a`
-  - 每次执行都会重新跑脚本，并以 upsert 方式覆盖 Notion 记录
+  - 默认去重：同一路径且文件未变化（基于 `size + mtime`）会自动跳过
+  - 文件有变化或首次出现时，才会执行脚本并 upsert Notion 记录
   - 单个文件失败时只记录失败，不自动重试
 - 页面展示最近一次执行记录
 
@@ -34,6 +35,7 @@ npm run dev
 
 - 配置文件：`/Users/david/projects/custom-python-script/audio_workflow_ui_ts/data/config.json`
 - 最近执行记录：`/Users/david/projects/custom-python-script/audio_workflow_ui_ts/data/last-run.json`
+- 去重索引：`/Users/david/projects/custom-python-script/audio_workflow_ui_ts/data/processed-files.json`
 
 ## 说明
 

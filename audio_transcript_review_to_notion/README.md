@@ -5,14 +5,15 @@
 1. 使用本地 Whisper 做语音转写（以英语为主）
 2. 转写文本排版为 Markdown（仅整理格式，不改写内容）
 3. 生成 `AI语法点评` 与 `AI重写`
-4. 保存两份本地 Markdown 文件
-5. 写入 Notion 主库 relation 列，并分别 upsert 到 `转录 / AI语法点评 / AI重写` 详情库
+4. 写入 Notion 主库 relation 列，并分别 upsert 到 `转录 / AI语法点评 / AI重写` 详情库
+5. （可选）保存两份本地 Markdown 文件
 
 ## 功能特性
 
 - 与现有脚本模块完全分离
 - 校验输入后缀（仅支持 `.mp3` / `.m4a`）
-- 本地输出文件：
+- 默认不落地本地 Markdown 文件。
+- 仅在传入 `--write-local-md` 时，才会输出：
   - `<audio_stem> - Transcript.md`
   - `<audio_stem> - Feedback.md`
 - Notion 数据结构：
@@ -80,10 +81,19 @@ python3 /Users/david/projects/custom-python-script/audio_transcript_review_to_no
   --model gpt-5
 ```
 
+可选：把 transcript/feedback 同时保存到音频同目录：
+
+```bash
+python3 /Users/david/projects/custom-python-script/audio_transcript_review_to_notion/audio_transcript_review_to_notion.py \
+  --audio /absolute/path/to/recording.mp3 \
+  --database-id YOUR_MAIN_DATABASE_ID \
+  --write-local-md
+```
+
 ## 说明
 
 - 当前版本面向“单人、清晰、以英语为主”的录音场景。
-- 若 Notion 入库失败，本地 Markdown 文件会保留，可后续重试上传。
+- 若启用了 `--write-local-md`，Notion 入库失败时本地 Markdown 文件会保留，可后续重试上传。
 - 主库必须至少包含这些属性：
   - `录音名`（title）
   - `转录`（relation）
