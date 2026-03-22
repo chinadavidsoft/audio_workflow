@@ -17,6 +17,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from notion_markdown_converter import markdown_to_notion_blocks as convert_markdown_to_notion_blocks
+except ImportError:
+    convert_markdown_to_notion_blocks = None  # type: ignore[assignment]
+
 
 NOTION_VERSION = "2022-06-28"
 NOTION_BASE_URL = "https://api.notion.com/v1"
@@ -144,36 +153,10 @@ def make_properties(audio_path: Path, processed_at_iso: str) -> dict:
     }
 
 
-def build_text_block(block_type: str, text: str) -> dict:
-    return {
-        "object": "block",
-        "type": block_type,
-        block_type: {"rich_text": rich_text_chunks(text)},
-    }
-
-
 def markdown_to_notion_blocks(markdown: str) -> list[dict]:
-    blocks: list[dict] = []
-    for raw_line in markdown.splitlines():
-        line = raw_line.rstrip()
-        if not line.strip():
-            continue
-
-        stripped = line.strip()
-        if stripped.startswith("### "):
-            blocks.append(build_text_block("heading_3", stripped[4:]))
-        elif stripped.startswith("## "):
-            blocks.append(build_text_block("heading_2", stripped[3:]))
-        elif stripped.startswith("# "):
-            blocks.append(build_text_block("heading_1", stripped[2:]))
-        elif stripped.startswith("- "):
-            blocks.append(build_text_block("bulleted_list_item", stripped[2:]))
-        else:
-            blocks.append(build_text_block("paragraph", line))
-
-    if not blocks:
-        blocks.append(build_text_block("paragraph", "(empty)"))
-    return blocks
+    if convert_markdown_to_notion_blocks is None:
+        fail("缺少 Markdown 解析依赖，请先安装: pip install markdown-it-py")
+    return convert_markdown_to_notion_blocks(markdown, rich_text_limit=NOTION_RICH_TEXT_LIMIT)
 
 
 def append_blocks(page_id: str, blocks: list[dict], notion_token: str) -> None:

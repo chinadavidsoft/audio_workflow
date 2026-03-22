@@ -27,7 +27,7 @@
 安装依赖：
 
 ```bash
-pip install faster-whisper
+pip install faster-whisper markdown-it-py
 ```
 
 环境变量：
@@ -97,4 +97,3 @@ python3 /Users/david/projects/custom-python-script/audio_transcript_review_codex
 ## 失败行为
 - 本地 Whisper 失败：流程中止，不会写 Notion。
 - Notion 写入失败：本地 Transcript/Feedback 会保留，便于重试。
-

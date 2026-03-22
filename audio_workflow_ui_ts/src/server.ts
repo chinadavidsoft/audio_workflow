@@ -73,6 +73,10 @@ type WorkflowHooks = {
   onLog?: (line: string) => void;
 };
 
+type RunWorkflowOptions = {
+  forceRewrite?: boolean;
+};
+
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const REPO_ROOT = path.resolve(PROJECT_ROOT, "..");
 const DATA_DIR = path.join(PROJECT_ROOT, "data");
@@ -374,9 +378,14 @@ function buildChildEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...process.env, ...overrides };
 }
 
-async function runWorkflow(config: AppConfig, hooks: WorkflowHooks = {}): Promise<RunReport> {
+async function runWorkflow(
+  config: AppConfig,
+  hooks: WorkflowHooks = {},
+  options: RunWorkflowOptions = {}
+): Promise<RunReport> {
   const started = new Date();
   const items: FileRunResult[] = [];
+  const forceRewrite = Boolean(options.forceRewrite);
 
   const requiredProblems: string[] = [];
   if (!config.audioInboxDir) {
@@ -430,11 +439,14 @@ async function runWorkflow(config: AppConfig, hooks: WorkflowHooks = {}): Promis
   let processedStateChanged = false;
   const pythonExecutable = await resolvePythonExecutable();
   hooks.onLog?.(`扫描完成，共发现 ${files.length} 个音频文件。`);
+  if (forceRewrite) {
+    hooks.onLog?.("已启用强制重写：将忽略去重并覆盖更新 Notion。");
+  }
 
   for (const [index, file] of files.entries()) {
     const audioFile = file.filePath;
     const prior = processedState.files[audioFile];
-    if (prior && prior.signature === file.signature) {
+    if (!forceRewrite && prior && prior.signature === file.signature) {
       items.push({
         filePath: audioFile,
         status: "skipped",
@@ -667,6 +679,10 @@ function renderPage(config: AppConfig, job: RunJobState, report: RunReport | nul
       <h2>执行</h2>
       <p id="run-feedback" class="muted">点击后将在后台执行，页面不会阻塞。</p>
       <form id="run-once-form" method="post" action="/run-once">
+        <label>
+          <input id="forceRewrite" name="forceRewrite" type="checkbox" />
+          强制重写 Notion（忽略去重，重新覆盖）
+        </label>
         <div class="actions">
           <button id="run-once-button" type="submit" ${job.status === "running" ? "disabled" : ""}>立即执行一次</button>
           <button class="secondary" type="button" onclick="location.reload()">刷新页面</button>
@@ -693,6 +709,7 @@ function renderPage(config: AppConfig, job: RunJobState, report: RunReport | nul
     <script>
       const runForm = document.getElementById("run-once-form");
       const runButton = document.getElementById("run-once-button");
+      const forceRewriteEl = document.getElementById("forceRewrite");
       const feedbackEl = document.getElementById("run-feedback");
       const summaryEl = document.getElementById("job-summary");
       const logsEl = document.getElementById("job-logs");
@@ -800,7 +817,13 @@ function renderPage(config: AppConfig, job: RunJobState, report: RunReport | nul
         try {
           const response = await fetch("/run-once", {
             method: "POST",
-            headers: { "Accept": "application/json" },
+            headers: {
+              "Accept": "application/json",
+              "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+            body: new URLSearchParams({
+              forceRewrite: forceRewriteEl && forceRewriteEl.checked ? "on" : "off",
+            }).toString(),
           });
           const payload = await response.json();
           feedbackEl.textContent = payload.message || "后台任务已启动。";
@@ -853,7 +876,7 @@ async function handleSaveConfig(req: IncomingMessage, res: ServerResponse): Prom
   redirect(res, "/?saved=1");
 }
 
-async function startWorkflowJob(config: AppConfig): Promise<void> {
+async function startWorkflowJob(config: AppConfig, options: RunWorkflowOptions = {}): Promise<void> {
   currentJob = {
     status: "running",
     startedAt: new Date().toISOString(),
@@ -864,12 +887,19 @@ async function startWorkflowJob(config: AppConfig): Promise<void> {
     message: "后台任务执行中",
   };
   pushJobLog("任务已启动。");
+  if (options.forceRewrite) {
+    pushJobLog("本次运行已启用强制重写。");
+  }
 
   try {
-    const report = await runWorkflow(config, {
-      onCurrentFile: setCurrentFile,
-      onLog: pushJobLog,
-    });
+    const report = await runWorkflow(
+      config,
+      {
+        onCurrentFile: setCurrentFile,
+        onLog: pushJobLog,
+      },
+      options
+    );
     await saveLastRunReport(report);
     currentJob = {
       ...currentJob,
@@ -913,13 +943,22 @@ async function handleRunOnce(_req: IncomingMessage, res: ServerResponse): Promis
     return;
   }
 
+  let forceRewrite = false;
+  try {
+    const body = await readBody(_req);
+    const form = parseForm(body);
+    forceRewrite = form.get("forceRewrite") === "on";
+  } catch {
+    forceRewrite = false;
+  }
+
   const config = await loadConfig();
-  void startWorkflowJob(config);
+  void startWorkflowJob(config, { forceRewrite });
   if (wantsJson) {
     sendJson(res, {
       started: true,
       status: "running",
-      message: "后台任务已启动。",
+      message: forceRewrite ? "后台任务已启动（强制重写）。" : "后台任务已启动。",
     });
     return;
   }

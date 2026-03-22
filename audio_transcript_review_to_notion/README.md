@@ -36,7 +36,7 @@
 安装依赖：
 
 ```bash
-pip install openai
+pip install openai markdown-it-py
 ```
 
 如果当前网络环境依赖 SOCKS 代理，还需要：

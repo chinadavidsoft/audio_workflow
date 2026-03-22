@@ -24,6 +24,15 @@ try:
 except ImportError:  # pragma: no cover - 运行时依赖检查
     OpenAI = None  # type: ignore[assignment]
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from notion_markdown_converter import markdown_to_notion_blocks as convert_markdown_to_notion_blocks
+except ImportError:
+    convert_markdown_to_notion_blocks = None  # type: ignore[assignment]
+
 
 SUPPORTED_EXTENSIONS = {".mp3", ".m4a"}
 DEFAULT_REVIEW_MODEL = "gpt-5-mini"
@@ -205,11 +214,10 @@ def request_markdown_text(client: OpenAI, model: str, system_prompt: str, user_p
 def request_grammar_review(client: OpenAI, model: str, transcript_markdown: str) -> str:
     system_prompt = "You are an English speaking coach. Be candid, direct, and useful."
     user_prompt = (
-        "Review the learner's spoken English transcript.\n"
-        "Output Markdown only. Do not use code fences. Do not wrap the answer in ```markdown.\n"
+        "Review the learner's spoken English transcript. Use Chinese to explain.\n"
+        "Use a Notion-compatible format.\n"
         "Cover grammar, word choice, naturalness, and clarity.\n"
-        "Quote concrete examples from the transcript.\n"
-        "Each key point must be English first, then Chinese.\n\n"
+        "Quote concrete examples from the transcript.\n\n"
         "Transcript:\n"
         f"{transcript_markdown}"
     )
@@ -220,7 +228,7 @@ def request_rewrite(client: OpenAI, model: str, transcript_markdown: str) -> str
     system_prompt = "You are an English speaking coach. Write concise, natural spoken English."
     user_prompt = (
         "Rewrite the learner's spoken English transcript.\n"
-        "Output Markdown only. Do not use code fences. Do not wrap the answer in ```markdown.\n"
+        "Use a Notion-compatible format.\n"
         "Provide one full improved rewrite in natural spoken English.\n"
         "After the rewrite, add a concise Chinese explanation of the main improvements.\n\n"
         "Transcript:\n"
@@ -258,14 +266,6 @@ def build_feedback_markdown(grammar_review: str, rewrite: str) -> str:
 
 def write_markdown(path: Path, content: str) -> None:
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
-
-
-def build_text_block(block_type: str, text: str) -> dict:
-    return {
-        "object": "block",
-        "type": block_type,
-        block_type: {"rich_text": rich_text_chunks(text)},
-    }
 
 
 def detect_socks_proxy() -> tuple[str, str] | None:
@@ -365,58 +365,10 @@ def rich_text_chunks(text: str) -> list[dict]:
     return chunks
 
 
-def strip_markdown_fence(markdown: str) -> str:
-    cleaned = markdown.strip()
-    fence_pattern = re.compile(r"^```(?:[A-Za-z0-9_-]+)?\s*\n(?P<body>.*)\n```$", re.DOTALL)
-    while True:
-        match = fence_pattern.match(cleaned)
-        if not match:
-            break
-        cleaned = match.group("body").strip()
-    return cleaned
-
-
 def markdown_to_notion_blocks(markdown: str) -> list[dict]:
-    cleaned = strip_markdown_fence(markdown)
-    blocks: list[dict] = []
-    paragraph_lines: list[str] = []
-
-    def flush_paragraph() -> None:
-        if not paragraph_lines:
-            return
-        text = " ".join(line.strip() for line in paragraph_lines if line.strip()).strip()
-        paragraph_lines.clear()
-        if text:
-            blocks.append(build_text_block("paragraph", text))
-
-    for raw_line in cleaned.splitlines():
-        line = raw_line.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            flush_paragraph()
-            continue
-        if stripped.startswith("### "):
-            flush_paragraph()
-            blocks.append(build_text_block("heading_3", stripped[4:].strip()))
-            continue
-        if stripped.startswith("## "):
-            flush_paragraph()
-            blocks.append(build_text_block("heading_2", stripped[3:].strip()))
-            continue
-        if stripped.startswith("# "):
-            flush_paragraph()
-            blocks.append(build_text_block("heading_1", stripped[2:].strip()))
-            continue
-        if stripped.startswith("- "):
-            flush_paragraph()
-            blocks.append(build_text_block("bulleted_list_item", stripped[2:].strip()))
-            continue
-        paragraph_lines.append(line)
-
-    flush_paragraph()
-    if not blocks:
-        blocks.append(build_text_block("paragraph", "(empty)"))
-    return blocks
+    if convert_markdown_to_notion_blocks is None:
+        fail("Missing dependency for Markdown parsing. Install with: pip install markdown-it-py")
+    return convert_markdown_to_notion_blocks(markdown, rich_text_limit=NOTION_RICH_TEXT_LIMIT)
 
 
 def append_blocks(page_id: str, blocks: list[dict], notion_token: str) -> None:
